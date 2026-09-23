@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "memory-system",
+  "description": "Task memories in docs/memories/ for Claude Code, with hooks that make sure they get written.",
+  "owner": {
+    "name": "atebites-hub",
+    "url": "https://github.com/atebites-hub/memory-system"
+  },
+  "plugins": [
+    {
+      "name": "memory-system",
+      "description": "One Markdown memory per task in docs/memories/, plus hooks: no edits without an in_progress memory, and a memory update after changes.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
