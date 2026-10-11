@@ -46,6 +46,7 @@ state_file() { # kind(mem|roots)
 record() { # kind line
   local f; f=$(state_file "$1") || return 0
   grep -qxF -- "$2" "$f" 2>/dev/null || printf '%s\n' "$2" >>"$f"
+  touch "$f" 2>/dev/null  # activity keeps the file clear of the 7-day prune
 }
 recorded() { # kind line
   local f; f=$(state_file "$1") || return 1
@@ -120,7 +121,7 @@ stale_files() { # root
   local r=$1 newest p
   newest=$(ls -t "$r"/docs/memories/[0-9]*.md 2>/dev/null | head -1)
   git -C "$r" -c core.quotepath=off status --porcelain --untracked-files=all 2>/dev/null |
-    cut -c4- | sed 's/.* -> //' | grep -v '^docs/memories/' |
+    cut -c4- | sed 's/.* -> //' | grep -v -e '^docs/memories/' -e '/$' |  # a trailing "/" is a nested repo or worktree
     while IFS= read -r p; do
       [ -e "$r/$p" ] || continue
       if [ -z "$newest" ] || [ "$r/$p" -nt "$newest" ]; then printf '%s\n' "$p"; fi

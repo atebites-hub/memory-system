@@ -67,7 +67,8 @@ t_outside_repo_passes() {
 t_gate_off() {
   local r; r=$(new_repo a)
   MEMORY_GATE=off run "$(pre s1 "$r/src/a.c")"; check "MEMORY_GATE=off passes PreToolUse" 0
-  echo z >"$r/src/new.c"
+  echo z >"$r/src/new.c"; stamp "$r/docs/memories/2020-01-01-old.md" 201901010000; stamp "$r/src/new.c" 202001020000
+  run "$(stop s1 "$r")"; check "(control) Stop blocks the same state without the off switch" 2
   MEMORY_GATE=off run "$(stop s1 "$r")"; check "MEMORY_GATE=off passes Stop" 0
 }
 t_stale_blocked() {
@@ -154,6 +155,25 @@ t_stop_worktree_edit() {
   stamp "$w/docs/memories/2026-10-11-wt-task.md" 202001030000
   run "$(stop s1 "$r")"; check "Stop passes when the worktree's memory is newer" 0
   run "$(stop s2 "$r")"; check "another session's Stop does not check that worktree" 0
+}
+t_stop_nested_worktree() {
+  local r w; r=$(new_repo a); w="$r/.claude/worktrees/wt"
+  git -C "$r" worktree add -q -b wtb "$w"
+  stamp "$r/docs/memories/2020-01-01-old.md" 201901010000; stamp "$w/docs/memories/2020-01-01-old.md" 201901010000
+  add_mem "$w" in_progress 2026-10-11-wt-task; stamp "$w/docs/memories/2026-10-11-wt-task.md" 202001010000
+  run "$(pre s1 "$w/src/a.c")"; check "edit in a worktree nested in the main checkout passes with its own memory" 0
+  run "$(stop s1 "$r")"; check "Stop does not report the nested worktree directory as a change in the main checkout" 0
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  run "$(stop s1 "$r")"; check "Stop names the nested worktree root, not the main root" 2 "in $w " "src/new.c"
+}
+t_session_state_kept_alive() {
+  local r f; r=$(new_repo a)
+  run "$(pre s1 "$r/docs/memories/2026-10-11-task.md")"
+  f=$(ls "$CLAUDE_PLUGIN_DATA"/sessions/s1.mem)
+  stamp "$f" "$(date -v-3d +%Y%m%d%H%M 2>/dev/null || date -d "3 days ago" +%Y%m%d%H%M)"
+  run "$(pre s1 "$r/docs/memories/2026-10-11-task.md")"
+  N=$((N + 1)); if [ -n "$(find "$f" -mtime -1)" ]; then PASS=$((PASS + 1)); echo "ok   $N re-recording refreshes the state file's mtime"
+  else FAIL=$((FAIL + 1)); echo "FAIL $N state file mtime not refreshed (would be pruned mid-session)"; fi
 }
 t_stop_cwd_root() {
   local r; r=$(new_repo a); add_mem "$r" in_progress 2026-10-11-task
