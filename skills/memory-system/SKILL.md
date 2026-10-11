@@ -7,7 +7,12 @@ description: Read and write task memories in docs/memories/. Use when planning, 
 
 Project task memories live in **`docs/memories/`** as Markdown files, one per task. This is separate from any host-level memory you may use.
 
-This plugin's hooks enforce the timing in any repo that has a `docs/memories/` directory: edits outside `docs/memories/` are blocked until an `in_progress` memory exists (writing the memory itself is always allowed), and finishing a turn after changing files asks you to update the memory first.
+This plugin's hooks enforce the timing in any repo that has a `docs/memories/` directory, per repo or git worktree (each worktree uses its own `docs/memories/`):
+
+- An edit outside `docs/memories/` is blocked until a **live** memory exists: `state: in_progress` and either new or changed in this working tree or branch (untracked, modified, staged, or committed on the branch since it left the default branch), or written by this session. Writing the memory itself is always allowed.
+- Finishing a turn after changing files (including files written through Bash) asks you to update the memory first.
+- An old `in_progress` memory from a finished task no longer unlocks edits: mark finished tasks `completed` (or `cancelled`).
+- `MEMORY_GATE=off` in the environment disables the hooks.
 
 ## When to use
 
