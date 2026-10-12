@@ -5,9 +5,11 @@
 #       (a) untracked/modified/staged in that working tree, or added/changed on this branch since the merge-base
 #           with the default branch (origin/HEAD, else main, else master), or
 #       (b) written by this session (recorded in a per-session state file).
+#     Paths git ignores are not gated. A subagent's edit (agent_id in the input) marks its root busy.
 #   PostToolUse (Bash): records the root of the hook's cwd, so Bash-written files are checked at Stop.
-#   Stop: for every root this session touched (plus the root of Stop's cwd), files changed after that root's
-#     newest memory -> update the memory before finishing.
+#   Stop: for every root this session touched (plus the root of Stop's cwd) that no subagent edited in the last
+#     AGENT_WINDOW_MIN minutes, files changed after that root's newest memory -> update the memory before
+#     finishing (on the default branch with no live memory: commit, revert or delete them instead).
 # Opt-in per repo: a repo without docs/memories/ is never gated. MEMORY_GATE=off disables every event.
 # Portable to bash 3.2 (macOS): no associative arrays, no mapfile, no ${var,,}. Never touches the network.
 set -u
@@ -36,8 +38,10 @@ repo_root() {
 }
 
 # ---- per-session state ------------------------------------------------------
+state_dir() { printf %s "${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/memory-system}/sessions"; }
 state_file() { # kind(mem|roots)
-  local dir="${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/memory-system}/sessions" sid
+  local dir sid
+  dir=$(state_dir)
   sid=$(printf %s "$SESSION" | tr -c 'A-Za-z0-9_-' '_')
   mkdir -p "$dir" 2>/dev/null || return 1
   find "$dir" -type f -mtime +7 -exec rm -f {} + 2>/dev/null
@@ -51,6 +55,22 @@ record() { # kind line
 recorded() { # kind line
   local f; f=$(state_file "$1") || return 1
   grep -qxF -- "$2" "$f" 2>/dev/null
+}
+
+# ---- subagents --------------------------------------------------------------
+# A subagent's edit marks the root busy, and the lead's Stop skips a busy root: the agent's unfinished work there
+# is not the lead's to record. Keyed by root, not session, so it holds whatever session_id a subagent carries.
+# shortcut: only Edit/Write-family edits mark a root (an agent's Bash cwd is the project dir, not its worktree),
+#   so an agent that changes files only through Bash goes unseen; track SubagentStart/SubagentStop if that matters.
+AGENT_WINDOW_MIN=30  # agents run test gates of up to 10 min between edits
+agent_marker() { # root
+  local dir; dir=$(state_dir)
+  mkdir -p "$dir" 2>/dev/null || return 1
+  printf '%s/agent-%s' "$dir" "$(printf %s "$1" | cksum | tr ' ' -)"
+}
+agent_busy() { # root
+  local m; m=$(agent_marker "$1") || return 1
+  [ -n "$(find "$m" -mmin -"$AGENT_WINDOW_MIN" 2>/dev/null)" ]
 }
 
 # ---- liveness of a memory ---------------------------------------------------
@@ -67,14 +87,20 @@ default_ref() { # root -> a ref naming the default branch
   return 1
 }
 
+on_default_branch() { # root
+  local def cur
+  def=$(default_ref "$1") || return 1
+  cur=$(git -C "$1" symbolic-ref -q --short HEAD 2>/dev/null)
+  [ "$cur" = "${def#origin/}" ]
+}
+
 # Repo-relative docs/memories paths that are dirty in the working tree or changed on this branch.
 changed_memories() { # root
-  local r=$1 def cur base
+  local r=$1 def base
   git -C "$r" -c core.quotepath=off status --porcelain --untracked-files=all -- docs/memories 2>/dev/null |
     cut -c4- | sed 's/.* -> //'
   def=$(default_ref "$r") || return 0
-  cur=$(git -C "$r" symbolic-ref -q --short HEAD 2>/dev/null)
-  [ "$cur" = "${def#origin/}" ] && return 0
+  on_default_branch "$r" && return 0
   base=$(git -C "$r" merge-base "$def" HEAD 2>/dev/null) || return 0
   git -C "$r" -c core.quotepath=off diff --name-only "$base" HEAD -- docs/memories 2>/dev/null
 }
@@ -91,7 +117,7 @@ live_memory_exists() { # root
 
 # ---- events -----------------------------------------------------------------
 on_pre() {
-  local f dir root pf mem
+  local f dir root pf mem m
   f=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$INPUT")
   [ -n "$f" ] || exit 0
   case "$f" in /*) ;; *) f="$CWD/$f" ;; esac
@@ -100,6 +126,8 @@ on_pre() {
   [ -d "$root/docs/memories" ] || exit 0
   pf=$(phys_path "$f"); mem="$root/docs/memories"
   case "$pf" in "$root"/*) ;; *) exit 0 ;; esac
+  [ -n "$AGENT" ] && m=$(agent_marker "$root") && touch "$m" 2>/dev/null
+  git -C "$root" check-ignore -q -- "${pf#"$root"/}" && exit 0  # Stop's git status never lists ignored paths
   record roots "$root"
   case "$pf" in
   "$mem"/*.md) record mem "$pf"; exit 0 ;;
@@ -136,9 +164,15 @@ on_stop() {
   roots=$( { cat "$rf" 2>/dev/null; [ -n "$cwdroot" ] && printf '%s\n' "$cwdroot"; } | sort -u)
   while IFS= read -r root; do
     [ -n "$root" ] && [ -d "$root/docs/memories" ] || continue
+    agent_busy "$root" && continue
     stale=$(stale_files "$root" | tr '\n' ' ')
     [ -n "$stale" ] || continue
-    echo "memory-system: files changed in $root after its last task-memory update: $(printf '%s' "$stale" | head -c 300). Update the task memory in $root/docs/memories/ (Status, Lessons, timestamps; state: completed if the task is done) before finishing." >&2
+    stale=$(printf '%s' "$stale" | head -c 300)
+    if on_default_branch "$root" && ! live_memory_exists "$root"; then
+      echo "memory-system: changes on the default branch in $root with no task in progress: $stale. Commit them through a branch and pull request, revert them, or delete them if untracked, before finishing." >&2
+    else
+      echo "memory-system: files changed in $root after its last task-memory update: $stale. Update the task memory in $root/docs/memories/ (Status, Lessons, timestamps; state: completed if the task is done) before finishing." >&2
+    fi
     exit 2
   done <<<"$roots"
   exit 0
@@ -146,6 +180,7 @@ on_stop() {
 
 INPUT=$(cat)
 SESSION=$(jq -r '.session_id // empty' <<<"$INPUT")
+AGENT=$(jq -r '.agent_id // empty' <<<"$INPUT")  # set only inside a subagent (agent_type alone also means --agent)
 CWD=$(jq -r '.cwd // empty' <<<"$INPUT"); [ -n "$CWD" ] || CWD=$PWD
 case "$(jq -r '.hook_event_name // empty' <<<"$INPUT")" in
 PreToolUse) on_pre ;;

@@ -36,6 +36,7 @@ json() { # event sid file cwd [extra jq args]
     '{hook_event_name:$e,session_id:$s,cwd:$c,tool_name:"Edit",tool_input:(if $f=="" then {} else {file_path:$f} end)}'
 }
 pre() { json PreToolUse "$1" "$2" "${3:-/}" ; }
+agent_pre() { pre "$@" | jq '.agent_id="a1" | .agent_type="general-purpose"'; }
 post_bash() { json PostToolUse "$1" "" "$2" | jq '.tool_name="Bash"'; }
 stop() { json Stop "$1" "" "$2" | jq --argjson a "${3:-false}" '.stop_hook_active=$a'; }
 
@@ -202,6 +203,60 @@ t_stop_ignores_memories_and_no_memdir() {
   run "$(stop s1 "$r")"; check "Stop ignores changes inside docs/memories" 0
   p=$(new_repo b 0); echo n >"$p/src/new.c"
   run "$(stop s1 "$p")"; check "Stop passes in a repo without docs/memories" 0
+}
+
+t_ignored_path_passes() {
+  local r p; r=$(new_repo a); mkdir -p "$T/$CASE-elsewhere"
+  printf 'logs/\n' >"$r/.gitignore"; git -C "$r" add .gitignore; git -C "$r" commit -q -m ignore
+  run "$(pre s1 "$r/logs/run/brief.md")"; check "edit of an ignored path in a missing dir passes without a live memory" 0
+  run "$(pre s1 "$r/src/a.c")"; check "(control) edit of a tracked path is still blocked" 2
+  p=$(new_repo b); printf 'logs/\n' >"$p/.gitignore"; git -C "$p" add .gitignore; git -C "$p" commit -q -m ignore
+  run "$(pre s2 "$p/logs/x.md")"
+  echo n >"$p/src/new.c"; stamp "$p/docs/memories/2020-01-01-old.md" 201901010000; stamp "$p/src/new.c" 202001020000
+  run "$(stop s2 "$T/$CASE-elsewhere")"; check "an ignored edit does not add its root to Stop's list" 0
+}
+t_tracked_ignored_gated() {
+  local r; r=$(new_repo a)
+  mkdir -p "$r/build" && echo k >"$r/build/keep.txt" && git -C "$r" add build/keep.txt && git -C "$r" commit -q -m keep
+  printf 'build/\n' >"$r/.gitignore"; git -C "$r" add .gitignore; git -C "$r" commit -q -m ignore
+  run "$(pre s1 "$r/build/keep.txt")"; check "a tracked file that matches an ignore pattern stays gated" 2
+}
+t_stop_default_branch_message() {
+  local r; r=$(new_repo a); stamp "$r/docs/memories/2020-01-01-old.md" 201901010000
+  echo n >"$r/junk.txt"; stamp "$r/junk.txt" 202001020000
+  run "$(stop s1 "$r")"; check "Stop on the default branch with no live memory says commit, revert or delete" 2 "default branch" "revert" "junk.txt"
+  N=$((N + 1)); case "$ERR" in *"Update the task memory"*) FAIL=$((FAIL + 1)); echo "FAIL $N default-branch message also asks for a memory update" ;;
+  *) PASS=$((PASS + 1)); echo "ok   $N default-branch message does not ask for a memory update" ;; esac
+  git -C "$r" checkout -q -b feat
+  run "$(stop s1 "$r")"; check "Stop on a feature branch asks for a memory update" 2 "Update the task memory" "junk.txt"
+}
+t_stop_default_branch_live_memory() {
+  local r; r=$(new_repo a); stamp "$r/docs/memories/2020-01-01-old.md" 201901010000
+  run "$(pre s1 "$r/docs/memories/2026-10-11-task.md")"
+  add_mem "$r" in_progress 2026-10-11-task; git -C "$r" add -A; git -C "$r" commit -q -m mem
+  stamp "$r/docs/memories/2026-10-11-task.md" 202001010000
+  echo n >"$r/src/new.c"; stamp "$r/src/new.c" 202001020000
+  run "$(stop s1 "$r")"; check "Stop on the default branch with a session-written live memory asks for a memory update" 2 "Update the task memory"
+}
+t_stop_skips_agent_busy_root() {
+  local r w; r=$(new_repo a); w="$T/$CASE-wt"
+  git -C "$r" worktree add -q -b wtb "$w"
+  stamp "$r/docs/memories/2020-01-01-old.md" 201901010000; stamp "$w/docs/memories/2020-01-01-old.md" 201901010000
+  run "$(pre s1 "$w/docs/memories/2026-10-11-wt-task.md")"
+  add_mem "$w" in_progress 2026-10-11-wt-task; stamp "$w/docs/memories/2026-10-11-wt-task.md" 202001010000
+  run "$(agent_pre s1 "$w/src/new.c")"; check "a subagent's edit with a live memory passes" 0
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  run "$(stop s1 "$r")"; check "the lead's Stop skips a worktree a subagent edited within the window" 0
+  run "$(stop s2 "$w")"; check "the busy mark is per root, so another session's Stop skips it too" 0
+  touch -t 202001010000 "$CLAUDE_PLUGIN_DATA"/sessions/agent-*
+  run "$(stop s1 "$r")"; check "Stop checks the worktree again once the mark is past the window" 2 "$w" "src/new.c"
+}
+t_lead_edit_marks_nothing() {
+  local r; r=$(new_repo a); add_mem "$r" in_progress 2026-10-11-task
+  run "$(pre s1 "$r/src/a.c")"; check "lead edit passes" 0
+  run "$(pre s1 "$r/src/a.c" | jq '.agent_type="main-agent"')"; check "an --agent session's edit (agent_type, no agent_id) passes" 0
+  N=$((N + 1)); if ls "$CLAUDE_PLUGIN_DATA"/sessions/agent-* >/dev/null 2>&1; then FAIL=$((FAIL + 1)); echo "FAIL $N an edit without agent_id marked its root busy"
+  else PASS=$((PASS + 1)); echo "ok   $N edits without agent_id mark no root busy"; fi
 }
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
