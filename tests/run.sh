@@ -247,9 +247,24 @@ t_stop_skips_agent_busy_root() {
   run "$(agent_pre s1 "$w/src/new.c")"; check "a subagent's edit with a live memory passes" 0
   echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
   run "$(stop s1 "$r")"; check "the lead's Stop skips a worktree a subagent edited within the window" 0
-  run "$(stop s2 "$w")"; check "the busy mark is per root, so another session's Stop skips it too" 0
+  run "$(pre s2 "$w/docs/memories/2026-10-11-wt-task.md")"
+  run "$(stop s2 "$r")"; check "the busy mark is per root, so another session's Stop skips it too" 0
   touch -t 202001010000 "$CLAUDE_PLUGIN_DATA"/sessions/agent-*
   run "$(stop s1 "$r")"; check "Stop checks the worktree again once the mark is past the window" 2 "$w" "src/new.c"
+}
+t_stop_cwd_root_never_skipped() {
+  local r; r=$(new_repo a); add_mem "$r" in_progress 2026-10-11-task
+  stamp "$r/docs/memories/2020-01-01-old.md" 201901010000; stamp "$r/docs/memories/2026-10-11-task.md" 202001010000
+  run "$(agent_pre s1 "$r/src/b.c")"; check "a subagent's edit in the main checkout passes" 0
+  echo n >"$r/src/lead.c"; stamp "$r/src/lead.c" 202001020000
+  run "$(stop s1 "$r")"; check "Stop still checks its own cwd root when a subagent marked it busy" 2 "$r" "src/lead.c"
+}
+t_ignored_memory_dir_recorded() {
+  local r; r=$(new_repo a 0); mkdir -p "$r/docs/memories"
+  printf 'docs/memories/\n' >"$r/.gitignore"; git -C "$r" add .gitignore; git -C "$r" commit -q -m ignore
+  run "$(pre s1 "$r/docs/memories/2026-10-11-task.md")"; check "writing a memory in an ignored docs/memories passes" 0
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(pre s1 "$r/src/a.c")"; check "a session-written memory in an ignored docs/memories is live" 0
 }
 t_lead_edit_marks_nothing() {
   local r; r=$(new_repo a); add_mem "$r" in_progress 2026-10-11-task

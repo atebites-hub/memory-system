@@ -7,9 +7,9 @@
 #       (b) written by this session (recorded in a per-session state file).
 #     Paths git ignores are not gated. A subagent's edit (agent_id in the input) marks its root busy.
 #   PostToolUse (Bash): records the root of the hook's cwd, so Bash-written files are checked at Stop.
-#   Stop: for every root this session touched (plus the root of Stop's cwd) that no subagent edited in the last
-#     AGENT_WINDOW_MIN minutes, files changed after that root's newest memory -> update the memory before
-#     finishing (on the default branch with no live memory: commit, revert or delete them instead).
+#   Stop: for every root this session touched (plus the root of Stop's cwd, always checked) that no subagent
+#     edited in the last AGENT_WINDOW_MIN minutes, files changed after that root's newest memory -> update the
+#     memory before finishing (on the default branch with no live memory: commit, revert or delete them instead).
 # Opt-in per repo: a repo without docs/memories/ is never gated. MEMORY_GATE=off disables every event.
 # Portable to bash 3.2 (macOS): no associative arrays, no mapfile, no ${var,,}. Never touches the network.
 set -u
@@ -58,8 +58,9 @@ recorded() { # kind line
 }
 
 # ---- subagents --------------------------------------------------------------
-# A subagent's edit marks the root busy, and the lead's Stop skips a busy root: the agent's unfinished work there
-# is not the lead's to record. Keyed by root, not session, so it holds whatever session_id a subagent carries.
+# A subagent's edit marks the root busy, and the lead's Stop skips a busy root other than its own cwd root: the
+# agent's unfinished work there is not the lead's to record (nor, until the mark lapses, the lead's own edits there).
+# Keyed by root, not session, so it holds whatever session_id a subagent carries.
 # shortcut: only Edit/Write-family edits mark a root (an agent's Bash cwd is the project dir, not its worktree),
 #   so an agent that changes files only through Bash goes unseen; track SubagentStart/SubagentStop if that matters.
 AGENT_WINDOW_MIN=30  # agents run test gates of up to 10 min between edits
@@ -127,7 +128,8 @@ on_pre() {
   pf=$(phys_path "$f"); mem="$root/docs/memories"
   case "$pf" in "$root"/*) ;; *) exit 0 ;; esac
   [ -n "$AGENT" ] && m=$(agent_marker "$root") && touch "$m" 2>/dev/null
-  git -C "$root" check-ignore -q -- "${pf#"$root"/}" && exit 0  # Stop's git status never lists ignored paths
+  # Stop's git status never lists ignored paths; memory writes are still recorded, ignored or not.
+  case "$pf" in "$mem"/*) ;; *) git -C "$root" check-ignore -q -- "${pf#"$root"/}" && exit 0 ;; esac
   record roots "$root"
   case "$pf" in
   "$mem"/*.md) record mem "$pf"; exit 0 ;;
@@ -164,7 +166,7 @@ on_stop() {
   roots=$( { cat "$rf" 2>/dev/null; [ -n "$cwdroot" ] && printf '%s\n' "$cwdroot"; } | sort -u)
   while IFS= read -r root; do
     [ -n "$root" ] && [ -d "$root/docs/memories" ] || continue
-    agent_busy "$root" && continue
+    [ "$root" != "$cwdroot" ] && agent_busy "$root" && continue  # the main agent's own checkout is always checked
     stale=$(stale_files "$root" | tr '\n' ' ')
     [ -n "$stale" ] || continue
     stale=$(printf '%s' "$stale" | head -c 300)
