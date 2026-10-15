@@ -9,6 +9,7 @@
   "plugins": [
     {
       "name": "memory-system",
+      "version": "0.2.2",
       "description": "One Markdown memory per task in docs/memories/, plus hooks: no edits without an in_progress memory, and a memory update after changes.",
       "source": "./",
       "category": "productivity"

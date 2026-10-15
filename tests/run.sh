@@ -47,6 +47,12 @@ run() { # JSON  (extra env via the caller's environment)
   ERR=$(printf %s "$1" | "$GATE" 2>&1 >/dev/null); RC=$?
 }
 
+run_manifest() { # JSON event plugin_root
+  local command
+  command=$(jq -r --arg event "$2" '.hooks[$event][0].hooks[0].command' "$HERE/../hooks/hooks.json")
+  ERR=$(printf %s "$1" | CLAUDE_PLUGIN_ROOT="$3" bash -c "$command" 2>&1 >/dev/null); RC=$?
+}
+
 check() { # description expected_rc [stderr-substring...]
   local d=$1 want=$2 s; shift 2
   N=$((N + 1)); local ok=1
@@ -60,6 +66,30 @@ check() { # description expected_rc [stderr-substring...]
 fresh_state() { export CLAUDE_PLUGIN_DATA="$T/data-$CASE"; rm -rf "$CLAUDE_PLUGIN_DATA"; }
 
 # ---- tests -----------------------------------------------------------------
+t_manifest_nonexecutable_cache() {
+  local r plugin memory; r=$(new_repo a 0)
+  mkdir -p "$r/docs/memories"
+  plugin="$T/$CASE/plugin with spaces"
+  mkdir -p "$plugin/hooks"
+  cp "$GATE" "$plugin/hooks/memory-gate.sh"
+  chmod 644 "$plugin/hooks/memory-gate.sh"
+  run_manifest "$(pre s1 "$r/src/a.c" "$r")" PreToolUse "$plugin"
+  check "manifest gates edits from a non-executable cache without a live memory" 2 "$r"
+  add_mem "$r" in_progress 2026-10-15-task
+  run_manifest "$(pre s1 "$r/src/a.c" "$r")" PreToolUse "$plugin"
+  check "manifest permits edits from a non-executable cache with a live memory" 0
+  add_mem "$r" completed 2026-10-15-task
+  run_manifest "$(pre s1 "$r/src/a.c" "$r")" PreToolUse "$plugin"
+  check "manifest blocks edits from a non-executable cache after memory completion" 2 "$r"
+  memory="$r/docs/memories/2026-10-15-task.md"
+  stamp "$memory" 202001010000
+  echo n >"$r/src/from-shell.c"
+  run_manifest "$(post_bash s2 "$r")" PostToolUse "$plugin"
+  check "manifest launches PostToolUse from a non-executable cache" 0
+  run_manifest "$(stop s2 "$T")" Stop "$plugin"
+  check "manifest launches Stop and checks the recorded shell root" 2 "$r" "src/from-shell.c"
+}
+
 t_codex_payloads() {
   local r patch; r=$(new_repo a)
   patch=$(printf '*** Begin Patch\n*** Update File: src/a.c\n@@\n-y\n+z\n*** End Patch\n')

@@ -1,6 +1,6 @@
 # memory-system
 
-A Claude Code and Codex plugin for task memories: one Markdown file per task in `docs/memories/`, and hooks that make sure they get written at the right times.
+A Claude Code, Codex, and ZCode plugin for task memories: one Markdown file per task in `docs/memories/`, and hooks that make sure they get written at the right times.
 
 - **Skill** `memory-system`: how to recall, create and update memories, with a template.
 - **PreToolUse hook** (Edit/Write/MultiEdit/NotebookEdit, including Codex `apply_patch`): an edit outside `docs/memories/` is blocked unless the edited file's own repo (or git worktree) has a *live* task memory. Writing the memory itself is always allowed.
@@ -36,7 +36,25 @@ mkdir -p docs/memories
 
 Codex uses the same hook definitions through its Edit/Write and Bash compatibility aliases. Both string and command-object `apply_patch` inputs are supported. Create or update the task memory in a separate tool call before patching other files: every affected path, including both ends of a move, must pass the gate before any memory write is recorded for the session.
 
-Requires `git` and `jq` (the hooks do nothing if `jq` is missing).
+### ZCode
+
+Use ZCode's native plugin manager with the same marketplace:
+
+```sh
+zcode plugins marketplace add atebites-hub/memory-system
+zcode plugins install memory-system@memory-system
+```
+
+To update an existing installation:
+
+```sh
+zcode plugins marketplace update memory-system
+zcode plugins update memory-system@memory-system
+```
+
+Start a new chat after installing or updating. Create `docs/memories/` in each repository to enable the gate. Hooks launch through Bash so they also work when a plugin cache does not preserve executable file permissions.
+
+Requires `git`, `jq`, and Bash 3.2 or newer (the hooks do nothing if `jq` is missing).
 
 ## Gate rules
 
@@ -59,7 +77,7 @@ The hook never uses the network and has a 10 s timeout. It needs bash 3.2 or new
 bash tests/run.sh
 ```
 
-Builds throwaway git repos and worktrees, feeds hook JSON to `hooks/memory-gate.sh` and asserts exit codes and messages. CI runs it on Linux and macOS.
+Builds throwaway git repos and worktrees, feeds hook JSON to `hooks/memory-gate.sh` and asserts exit codes and messages. It also executes the manifest commands against a non-executable script copied to a plugin path with spaces. CI runs it on Linux and macOS.
 
 ## License
 
