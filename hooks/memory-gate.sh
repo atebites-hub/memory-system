@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Enforces the memory-system skill's timing (exit 2 = block + message to Claude).
-#   PreToolUse (Edit|Write|MultiEdit|NotebookEdit): an edit outside docs/memories/ needs a LIVE task memory
+#   PreToolUse (Edit|Write|MultiEdit|NotebookEdit|apply_patch): an edit outside docs/memories/ needs a LIVE task memory
 #     in the edited file's own repo or worktree. Live = state: in_progress AND either
 #       (a) untracked/modified/staged in that working tree, or added/changed on this branch since the merge-base
 #           with the default branch (origin/HEAD, else main, else master), or
@@ -19,12 +19,37 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 IN_PROGRESS_RE='^[[:space:]]*-?[[:space:]]*state:[[:space:]]*in_progress[[:space:]]*$'
 
 # ---- paths ------------------------------------------------------------------
-# Physical path of a (possibly not yet existing) file: resolve the nearest existing directory, keep the rest.
+# Resolve .. and symlinks component by component; unlink keeps the final link path.
 phys_path() {
-  local p=$1 rest=""
+  local p=$1 mode=${2:-write} pending resolved="" part target links=0
   case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
-  while [ ! -d "$p" ]; do rest="/$(basename "$p")$rest"; p=$(dirname "$p"); done
-  printf '%s%s' "$(cd "$p" && pwd -P)" "$rest"
+  pending=${p#/}
+  while [ -n "$pending" ]; do
+    part=${pending%%/*}
+    case "$pending" in */*) pending=${pending#*/} ;; *) pending="" ;; esac
+    case "$part" in
+    ""|.) ;;
+    ..) resolved=${resolved%/*} ;;
+    *)
+      resolved="$resolved/$part"
+      if [ -L "$resolved" ] && { [ "$mode" != unlink ] || [ -n "$pending" ]; }; then
+        links=$((links + 1))
+        if [ "$links" -gt 40 ]; then
+          echo "memory-system: cannot resolve $p: too many symbolic links (possible cycle)." >&2
+          return 1
+        fi
+        target=$(readlink "$resolved") || {
+          echo "memory-system: cannot read symbolic link $resolved." >&2
+          return 1
+        }
+        resolved=${resolved%/*}
+        case "$target" in /*) resolved=""; target=${target#/} ;; esac
+        pending="$target${pending:+/$pending}"
+      fi
+      ;;
+    esac
+  done
+  printf '%s' "${resolved:-/}"
 }
 
 # Physical toplevel of the repo/worktree containing directory $1 (nearest existing ancestor); empty if none.
@@ -90,24 +115,72 @@ live_memory_exists() { # root
 }
 
 # ---- events -----------------------------------------------------------------
-on_pre() {
-  local f dir root pf mem
-  f=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$INPUT")
-  [ -n "$f" ] || exit 0
+# Delete and move sources unlink the final path; other edits write through final symlinks.
+tool_paths() {
+  jq -r --arg cwd "$CWD" '
+    # Codex joins patch paths lexically before resolving filesystem symlinks.
+    def path:
+      sub("^\\*\\*\\* (Add File|Update File|Delete File|Move to): "; "") |
+      (if startswith("/") then . else $cwd + "/" + . end) |
+      reduce (split("/")[]) as $part
+        ([]; if $part == "" or $part == "." then . elif $part == ".." then .[:-1] else . + [$part] end) |
+      "/" + join("/");
+    .tool_input |
+    if type == "object" and (.file_path // .notebook_path) then "write:" + (.file_path // .notebook_path)
+    else
+      (if type == "string" then . elif type == "object" then .command // empty else empty end) |
+      reduce (split("\n")[]) as $raw
+        ({state:"start", move:false, paths:[]};
+         .state as $state | .move as $move | .move=false |
+         # In Update hunks leading whitespace denotes context, not header indentation.
+         ($raw | if $state == "update" then sub("\\s+$"; "") else gsub("^\\s+|\\s+$"; "") end) as $line |
+         if $line | startswith("*** Add File: ") then
+           .state="add" | .paths += ["write:" + ($line | path)]
+         elif $line | startswith("*** Delete File: ") then
+           .state="delete" | .paths += ["unlink:" + ($line | path)]
+         elif $line | startswith("*** Update File: ") then
+           .state="update" | .move=true | .paths += ["write:" + ($line | path)]
+         elif $state == "update" and $move and ($line | startswith("*** Move to: ")) then
+           .paths[-1] |= sub("^write:"; "unlink:") |
+           .paths += ["write:" + ($line | path)]
+         else . end) | .paths[]
+    end
+  ' <<<"$INPUT"
+}
+
+check_path() {
+  local mode=${1%%:*} f=${1#*:} dir root pf mem
+  [ -n "$f" ] || return 0
   case "$f" in /*) ;; *) f="$CWD/$f" ;; esac
-  dir=$(dirname "$f")
-  root=$(repo_root "$dir") && [ -n "$root" ] || exit 0
-  [ -d "$root/docs/memories" ] || exit 0
-  pf=$(phys_path "$f"); mem="$root/docs/memories"
-  case "$pf" in "$root"/*) ;; *) exit 0 ;; esac
+  pf=$(phys_path "$f" "$mode") || return 2
+  dir=$(dirname "$pf")
+  root=$(repo_root "$dir") && [ -n "$root" ] || return 0
+  [ -d "$root/docs/memories" ] || return 0
+  mem="$root/docs/memories"
+  case "$pf" in "$root"/*) ;; *) return 0 ;; esac
   record roots "$root"
   case "$pf" in
-  "$mem"/*.md) record mem "$pf"; exit 0 ;;
-  "$mem"/*) exit 0 ;;
+  "$mem"/*) return 0 ;;
   esac
-  live_memory_exists "$root" && exit 0
+  live_memory_exists "$root" && return 0
   echo "memory-system: no live task memory in $root. Create $root/docs/memories/YYYY-MM-DD-<slug>.md from the skill's template with 'state: in_progress' before editing. An old in_progress memory from a finished task does not count: mark it completed." >&2
-  exit 2
+  return 2
+}
+
+on_pre() {
+  local paths entry mode f root pf
+  paths=$(tool_paths)
+  while IFS= read -r entry; do check_path "$entry" || exit 2; done <<<"$paths"
+  # Record memory writes only after every path passes: blocked patches must not unlock stale memories.
+  while IFS= read -r entry; do
+    mode=${entry%%:*}; f=${entry#*:}
+    [ -n "$f" ] || continue
+    case "$f" in /*) ;; *) f="$CWD/$f" ;; esac
+    pf=$(phys_path "$f" "$mode") || exit 2
+    root=$(repo_root "$(dirname "$pf")") && [ -n "$root" ] || continue
+    case "$pf" in "$root"/docs/memories/*.md) record mem "$pf" ;; esac
+  done <<<"$paths"
+  exit 0
 }
 
 on_post() {

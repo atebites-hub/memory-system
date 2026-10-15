@@ -36,6 +36,10 @@ json() { # event sid file cwd [extra jq args]
     '{hook_event_name:$e,session_id:$s,cwd:$c,tool_name:"Edit",tool_input:(if $f=="" then {} else {file_path:$f} end)}'
 }
 pre() { json PreToolUse "$1" "$2" "${3:-/}" ; }
+patch_pre() { # sid cwd patch [string|command]
+  jq -n --arg s "$1" --arg c "$2" --arg p "$3" --arg shape "${4:-command}" \
+    '{hook_event_name:"PreToolUse",session_id:$s,cwd:$c,tool_name:"apply_patch",tool_input:(if $shape=="string" then $p else {command:$p} end)}'
+}
 post_bash() { json PostToolUse "$1" "" "$2" | jq '.tool_name="Bash"'; }
 stop() { json Stop "$1" "" "$2" | jq --argjson a "${3:-false}" '.stop_hook_active=$a'; }
 
@@ -47,6 +51,7 @@ check() { # description expected_rc [stderr-substring...]
   local d=$1 want=$2 s; shift 2
   N=$((N + 1)); local ok=1
   [ "$RC" = "$want" ] || ok=0
+  if [ "$want" = 0 ] && [ -n "$ERR" ]; then ok=0; fi
   for s in "$@"; do case "$ERR" in *"$s"*) ;; *) ok=0 ;; esac; done
   if [ $ok = 1 ]; then PASS=$((PASS + 1)); echo "ok   $N $d"
   else FAIL=$((FAIL + 1)); echo "FAIL $N $d (rc=$RC want $want; stderr: $ERR)"; fi
@@ -55,6 +60,193 @@ check() { # description expected_rc [stderr-substring...]
 fresh_state() { export CLAUDE_PLUGIN_DATA="$T/data-$CASE"; rm -rf "$CLAUDE_PLUGIN_DATA"; }
 
 # ---- tests -----------------------------------------------------------------
+t_codex_payloads() {
+  local r patch; r=$(new_repo a)
+  patch=$(printf '*** Begin Patch\n*** Update File: src/a.c\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex command-object update is gated" 2 "$r"
+  run "$(patch_pre s1 "$r" "$patch" string)"; check "Codex string update is gated" 2 "$r"
+  run "$(patch_pre s1 "$r" "$(printf '%s\r\n' '*** Begin Patch' '*** Delete File: src/a.c' '*** End Patch')")"
+  check "Codex CRLF headers are gated" 2 "$r"
+  run "$(json PreToolUse s1 "" "$r")"; check "empty non-edit payload stays a no-op" 0
+  run "$(pre s1 "$r/src/a.c" | jq '.tool_name="NotebookEdit" | .tool_input.notebook_path=.tool_input.file_path | del(.tool_input.file_path)')"
+  check "Claude notebook_path remains gated" 2 "$r"
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex update passes with a live memory" 0
+}
+t_codex_operations() {
+  local r patch; r=$(new_repo a)
+  patch=$(printf '*** Begin Patch\n*** Add File: new/missing/file.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex added file in missing directories is gated" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Delete File: src/a.c\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex deletion is gated" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Update File: docs/memories/2020-01-01-old.md\n*** Move to: src/moved.md\n@@\n-# task\n+# moved\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex move destination outside memories is gated" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Update File: src/a.c\n*** Move to: docs/memories/2026-10-11-moved.md\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "Codex move source outside memories is gated" 2 "$r"
+}
+t_codex_multi_file() {
+  local r other patch; r=$(new_repo a); other=$(new_repo 'with space')
+  add_mem "$r" in_progress 2026-10-11-task
+  patch=$(printf '*** Begin Patch\n*** Update File: %s/src/a.c\n@@\n-y\n+z\n*** Add File: %s/src/a file.c\n+x\n*** End Patch\n' "$r" "$other")
+  run "$(patch_pre s1 "$r" "$patch")"; check "all files and roots in one Codex patch must pass" 2 "$other"
+  add_mem "$other" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$patch")"; check "multi-repo patch passes when both roots have live memories" 0
+}
+t_codex_memory_recording() {
+  local r patch; r=$(new_repo a)
+  patch=$(printf '*** Begin Patch\n*** Update File: docs/memories/2020-01-01-old.md\n@@\n-# task\n+# revised\n*** Update File: src/a.c\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "same-patch memory update cannot unlock code edits" 2 "$r"
+  run "$(pre s1 "$r/src/a.c")"; check "blocked patch leaves no session memory authorization" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/2026-10-11-task.md\n+state: in_progress\n+*** Update File: src/a.c\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch" string)"; check "memory patch ignores source-like text in added content" 0
+  add_mem "$r" in_progress 2026-10-11-task; git -C "$r" add -A; git -C "$r" commit -q -m mem
+  run "$(pre s1 "$r/src/a.c")"; check "successful Codex memory write is remembered by the session" 0
+  run "$(pre s2 "$r/src/a.c")"; check "Codex memory authorization stays session-local" 2 "$r"
+}
+t_codex_path_safety() {
+  local r patch; r=$(new_repo 'with space')
+  patch=$(printf '*** Begin Patch\n*** Update File: docs/memories/../../src/a.c\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "memory directory traversal does not exempt source edits" 2 "$r"
+  ln -s "$r/src" "$r/docs/memories/source"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/source/new.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"; check "symlinked memory subdirectory does not exempt source edits" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Add File: a file with spaces.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r/src" "$patch" string)"; check "relative paths use hook cwd and preserve spaces" 2 "$r"
+}
+t_codex_missing_parent_traversal() {
+  local r patch; r=$(new_repo a)
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/missing/../../../src/new.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "missing directories before .. do not exempt source edits" 2 "$r"
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "missing-parent traversal passes with a live memory" 0
+}
+t_codex_file_symlinks() {
+  local r other patch; r=$(new_repo a); other=$(new_repo 'other repo')
+  ln -s ../../src/a.c "$r/docs/memories/source.md"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/source.md\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a final-file symlink in memories does not exempt its source target" 2 "$r"
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a relative file symlink passes with its target repo memory" 0
+  ln -s "$other/src/new.c" "$r/docs/memories/other.md"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/other.md\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a dangling cross-repo symlink needs the target repo memory" 2 "$other"
+  add_mem "$other" in_progress 2026-10-11-task
+  rm "$r/docs/memories/2026-10-11-task.md"
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a cross-repo symlink uses the target repo live memory" 0
+}
+t_codex_symlink_cycles() {
+  local r patch; r=$(new_repo a)
+  ln -s loop.md "$r/docs/memories/loop.md"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/loop.md\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a final-file symlink cycle fails with a diagnostic" 2 "cannot resolve" "too many symbolic links"
+  ln -s loop-b "$r/docs/memories/loop-a"
+  ln -s loop-a "$r/docs/memories/loop-b"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/loop-a/new.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a parent-directory symlink cycle fails with a diagnostic" 2 "cannot resolve" "too many symbolic links"
+}
+t_codex_symlink_memory_recording() {
+  local r other patch; r=$(new_repo a); other=$(new_repo b)
+  ln -s "$other/docs/memories/2026-10-11-task.md" "$r/task.md"
+  patch=$(printf '*** Begin Patch\n*** Add File: task.md\n+state: in_progress\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "writing a cross-repo symlink to a memory is allowed" 0
+  add_mem "$other" in_progress 2026-10-11-task
+  git -C "$other" add -A; git -C "$other" commit -q -m mem
+  run "$(pre s1 "$other/src/a.c")"
+  check "symlinked memory authorization records the resolved target" 0
+  run "$(pre s2 "$other/src/a.c")"
+  check "symlinked memory authorization remains session-local" 2 "$other"
+}
+t_codex_symlink_unlinks() {
+  local r other gated patch deletion move; r=$(new_repo a); other=$(new_repo b 0); gated=$(new_repo c)
+  ln -s "$other/src/a.c" "$r/src/link.c"
+  deletion=$(printf '*** Begin Patch\n*** Delete File: src/link.c\n*** End Patch\n')
+  move=$(printf '*** Begin Patch\n*** Update File: src/link.c\n*** Move to: docs/memories/2026-10-11-moved.md\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$deletion")"
+  check "deleting a symlink needs its containing repo memory" 2 "$r"
+  run "$(patch_pre s1 "$r" "$move")"
+  check "moving a symlink needs its containing repo memory" 2 "$r"
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$deletion")"
+  check "symlink deletion passes with its containing repo memory" 0
+  run "$(patch_pre s1 "$r" "$move")"
+  check "symlink move passes with its containing repo memory" 0
+  rm "$r/src/link.c"; ln -s "$gated/src/a.c" "$r/src/link.c"
+  run "$(patch_pre s1 "$r" "$deletion")"
+  check "symlink deletion does not need its target repo memory" 0
+  run "$(patch_pre s1 "$r" "$move")"
+  check "symlink move source does not need its target repo memory" 0
+  ln -s cycle.c "$r/src/cycle.c"
+  patch=$(printf '*** Begin Patch\n*** Delete File: src/cycle.c\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "unlinking a final symlink cycle does not resolve its target" 0
+  ln -s "$gated/src" "$r/docs/memories/directory"
+  patch=$(printf '*** Begin Patch\n*** Delete File: docs/memories/directory/a.c\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "unlink operations still resolve parent-directory symlinks" 2 "$gated"
+  patch=$(printf '*** Begin Patch\n*** Update File: src/link.c\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "an update without a move still needs the symlink target memory" 2 "$gated"
+  ln -s "$gated/src/a.c" "$r/docs/memories/destination.md"
+  patch=$(printf '*** Begin Patch\n*** Update File: src/link.c\n*** Move to: docs/memories/destination.md\n@@\n-y\n+z\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "move destinations still follow final symlinks" 2 "$gated"
+  ln -s "$gated/docs/memories/2020-01-01-old.md" "$r/src/memory.md"
+  patch=$(printf '*** Begin Patch\n*** Delete File: src/memory.md\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "deleting a memory alias is allowed with its containing repo memory" 0
+  run "$(pre s1 "$gated/src/a.c")"
+  check "unlinking a memory alias does not authorize its target memory" 2 "$gated"
+  other=$(new_repo "$(printf ' \twith: spaces')")
+  ln -s "$gated/src/a.c" "$other/src/link.c"
+  patch=$(printf '*** Begin Patch\n*** Delete File: %s/src/link.c\n*** End Patch\n' "$other")
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "operation prefixes preserve spaces, tabs, and colons in repo paths" 2 "$other"
+}
+t_codex_header_whitespace() {
+  local r patch; r=$(new_repo a)
+  patch=$(printf '*** Begin Patch\n  *** Add File: src/new.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "native indentation before the first Add header is gated" 2 "$r"
+  ln -s ../../src/a.c "$r/docs/memories/source.md"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/source.md   \n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "trailing header whitespace does not hide a source symlink" 2 "$r"
+  patch=$(printf '*** Begin Patch\n*** Update File: docs/memories/2020-01-01-old.md\n@@\n *** Add File: src/context.c\n+text\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "header-like update context is not treated as another edited path" 0
+}
+t_codex_lexical_paths() {
+  local r other patch; r=$(new_repo a); other=$(new_repo b 0)
+  mkdir -p "$other/sub"; ln -s "$other/sub" "$r/src/link"
+  patch=$(printf '*** Begin Patch\n*** Add File: src/link/../new.c\n+x\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "Codex normalizes .. before following a directory symlink" 2 "$r"
+  run "$(pre s1 "$r/src/link/../new.c")"
+  check "legacy file paths retain physical symlink and .. semantics" 0
+  add_mem "$r" in_progress 2026-10-11-task
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a lexically normalized Codex edit passes with its repo memory" 0
+  rm "$r/docs/memories/2026-10-11-task.md"
+  ln -s "$other/sub" "$r/docs/memories/link"
+  patch=$(printf '*** Begin Patch\n*** Add File: docs/memories/link/../2026-10-11-task.md\n+state: in_progress\n*** End Patch\n')
+  run "$(patch_pre s1 "$r" "$patch")"
+  check "a lexically normalized Codex memory path is allowed" 0
+  add_mem "$r" in_progress 2026-10-11-task
+  git -C "$r" add -A; git -C "$r" commit -q -m mem
+  run "$(pre s1 "$r/src/a.c")"
+  check "Codex records the lexically normalized memory target" 0
+  run "$(pre s2 "$r/src/a.c")"
+  check "normalized memory authorization remains session-local" 2 "$r"
+}
 t_no_memdir_passes() {
   local r; r=$(new_repo a 0)
   run "$(pre s1 "$r/src/a.c")"; check "repo without docs/memories passes" 0
