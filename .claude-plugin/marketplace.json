@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "memory-system",
-  "description": "Task memories in docs/memories/ for Claude Code, with hooks that make sure they get written.",
+  "description": "Task memories in docs/memories/ for Claude Code and Codex, with hooks that make sure they get written.",
   "owner": {
     "name": "atebites-hub",
     "url": "https://github.com/atebites-hub/memory-system"
