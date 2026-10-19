@@ -77,7 +77,7 @@ The hook never uses the network and has a 10 s timeout. It needs bash 3.2 or new
 bash tests/run.sh
 ```
 
-Builds throwaway git repos and worktrees, feeds hook JSON to `hooks/memory-gate.sh` and asserts exit codes and messages. It also executes the manifest commands against a non-executable script copied to a plugin path with spaces. CI runs it on Linux and macOS.
+Builds throwaway git repos and worktrees, feeds hook JSON to `hooks/memory-gate.sh` and asserts exit codes and messages. It also executes the manifest commands against a non-executable script copied to a plugin path with spaces.
 
 ## License
 
