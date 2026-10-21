@@ -6,8 +6,9 @@
 #           with the default branch (origin/HEAD, else main, else master), or
 #       (b) written by this session (recorded in a per-session state file).
 #     Paths git ignores are not gated. An agent's edit (agent_id in the input, or a /subagents/ transcript path)
-#     marks its root busy for AGENT_WINDOW_MIN minutes.
-#   PostToolUse (Bash): records the root of the hook's cwd, so Bash-written files are checked at Stop.
+#     marks its root busy for AGENT_WINDOW_MIN minutes, as does an agent's Bash command that starts with cd <dir>.
+#     An agent's event never adds a root to the session's list: its work is not the lead's to record.
+#   PostToolUse (Bash): records the root of the hook's cwd (a lead's only), so Bash-written files are checked at Stop.
 #   Stop: for every root this session touched (plus the root of Stop's cwd) except a busy one, files changed after
 #     that root's newest memory -> update the memory before finishing (on the default branch with no live memory:
 #     commit, revert or delete them instead). The project's main checkout (CLAUDE_PROJECT_DIR's root, else Stop's
@@ -89,8 +90,9 @@ recorded() { # kind line
 # An agent's edit marks the root busy, and the lead's Stop skips a busy root other than the project's main checkout:
 # the agent's unfinished work there is not the lead's to record. Keyed by root, not session, so it holds whatever
 # session_id an agent carries.
-# shortcut: only Edit/Write-family edits mark a root (an agent's Bash cwd is the project dir, not its worktree),
-#   so an agent that changes files only through Bash goes unseen; track SubagentStart/SubagentStop if that matters.
+# shortcut: only Edit/Write-family edits and a Bash command that starts with cd <dir> mark a root (an agent's Bash cwd
+#   is the project dir, not its worktree), so an agent whose Bash commands do not start with cd <its worktree> goes
+#   unseen; track SubagentStart/SubagentStop if that matters.
 AGENT_WINDOW_MIN=30  # agents run test gates of up to 10 min between edits
 agent_marker() { # root
   local dir; dir=$(state_dir)
@@ -190,11 +192,11 @@ check_path() {
   case "$pf" in "$root"/*) ;; *) return 0 ;; esac
   [ -n "$AGENT" ] && touch "$(agent_marker "$root")" 2>/dev/null
   case "$pf" in
-  "$mem"/*) record roots "$root"; return 0 ;;
+  "$mem"/*) [ -n "$AGENT" ] || record roots "$root"; return 0 ;;
   esac
   # Stop's git status never lists ignored paths (memory writes above are recorded, ignored or not).
   git -C "$root" check-ignore -q -- "${pf#"$root"/}" && return 0
-  record roots "$root"
+  [ -n "$AGENT" ] || record roots "$root"
   live_memory_exists "$root" && return 0
   echo "memory-system: no live task memory in $root. Create $root/docs/memories/YYYY-MM-DD-<slug>.md from the skill's template with 'state: in_progress' before editing. An old in_progress memory from a finished task does not count: mark it completed." >&2
   return 2
@@ -216,8 +218,29 @@ on_pre() {
   exit 0
 }
 
+# The directory a Bash command starts with "cd" into (bare, or in single or double quotes), made absolute.
+leading_cd() { # command
+  local d=$1
+  d=${d#"${d%%[![:space:]]*}"}
+  case "$d" in cd[[:space:]]*) ;; *) return 0 ;; esac
+  d=${d#cd}; d=${d#"${d%%[![:space:]]*}"}
+  case "$d" in
+  \"*) d=${d#\"}; d=${d%%\"*} ;;
+  \'*) d=${d#\'}; d=${d%%\'*} ;;
+  *) d=${d%%[[:space:]&;|]*} ;;
+  esac
+  [ -n "$d" ] || return 0
+  case "$d" in /*) ;; *) d="$CWD/$d" ;; esac
+  [ -d "$d" ] && printf %s "$d"
+}
+
 on_post() {
   local root
+  if [ -n "$AGENT" ]; then
+    root=$(repo_root "$(leading_cd "$(jq -r '.tool_input.command // empty' <<<"$INPUT")")") &&
+      [ -n "$root" ] && [ -d "$root/docs/memories" ] && touch "$(agent_marker "$root")" 2>/dev/null
+    exit 0
+  fi
   root=$(repo_root "$CWD") && [ -n "$root" ] && [ -d "$root/docs/memories" ] && record roots "$root"
   exit 0
 }

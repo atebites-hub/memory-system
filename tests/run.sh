@@ -505,7 +505,7 @@ t_stop_busy_worktree_as_cwd() {
 t_stop_main_checkout_never_skipped() {
   local r w; r=$(new_repo a); w="$T/$CASE-0wt"; agent_worktree "$r" "$w"  # $w sorts before $r
   add_mem "$r" in_progress 2026-10-11-task; stamp "$r/docs/memories/2026-10-11-task.md" 202001010000
-  run "$(agent_pre s1 "$w/src/new.c")"; run "$(agent_pre s1 "$r/src/b.c")"
+  run "$(agent_pre s1 "$w/src/new.c")"; run "$(agent_pre s1 "$r/src/b.c")"; run "$(pre s1 "$r/src/b.c")"  # the lead records $r itself
   echo n >"$w/src/new.c"; echo n >"$r/src/lead.c"; stamp "$w/src/new.c" 202001020000; stamp "$r/src/lead.c" 202001020000
   CLAUDE_PROJECT_DIR=$r run "$(stop s1 "$w")"; check "Stop checks the main checkout even when an agent marked it busy" 2 "$r" "src/lead.c"
   lacks "the busy worktree holding Stop's cwd is skipped in the same Stop" "$w"
@@ -543,6 +543,52 @@ t_stop_lists_eight_paths() {
   rm "$r/src/long-file-name-09.c" "$r/src/long-file-name-10.c"
   run "$(stop s1 "$r")"; check "Stop names exactly 8 paths without a count" 2 "src/long-file-name-08.c"
   lacks "no 'more' when 8 paths fit" "more"
+}
+# agent_post_bash SID CWD COMMAND: an agent's PostToolUse Bash event.
+agent_post_bash() { post_bash "$1" "$2" | jq --arg c "$3" '.agent_id="a1" | .tool_input={command:$c}'; }
+no_markers() { # description: no agent busy mark exists
+  N=$((N + 1)); if ls "$CLAUDE_PLUGIN_DATA"/sessions/agent-* >/dev/null 2>&1; then FAIL=$((FAIL + 1)); echo "FAIL $N $1"
+  else PASS=$((PASS + 1)); echo "ok   $N $1"; fi
+}
+t_agent_edit_adds_no_root() {
+  local r w; r=$(new_repo a); w="$T/$CASE-wt"; agent_worktree "$r" "$w"
+  run "$(agent_pre s1 "$w/src/new.c")"; run "$(agent_pre s1 "$w/docs/memories/2026-10-11-wt-task.md")"
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  touch -t 202001010000 "$CLAUDE_PLUGIN_DATA"/sessions/agent-*
+  run "$(stop s1 "$r")"; check "an agent's edits (code and memory) do not put its worktree on the lead's Stop list, even past the busy window" 0
+}
+t_agent_bash_cd_marks_busy() {
+  local r w c; r=$(new_repo a); w="$T/$CASE-wt"; agent_worktree "$r" "$w"
+  run "$(pre s1 "$w/src/a.c")"  # the lead edited there, so Stop lists it
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  run "$(stop s1 "$r")"; check "(control) without an agent mark Stop checks the worktree" 2 "$w" "src/new.c"
+  for c in "cd $w && fmt" "  cd $w; fmt" "cd \"$w\" && fmt" "cd '$w' | fmt" "cd ../${w##*/} && fmt" "cd $w"; do
+    rm -f "$CLAUDE_PLUGIN_DATA"/sessions/agent-*
+    run "$(agent_post_bash s1 "$r" "$c")"; check "agent Bash '$c' exits 0" 0
+    run "$(stop s1 "$r")"; check "agent Bash '$c' marks the worktree busy" 0
+  done
+}
+t_agent_bash_other_forms_mark_nothing() {
+  local r w c; r=$(new_repo a); w="$T/$CASE-wt"; agent_worktree "$r" "$w"
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  for c in "echo hi" "echo cd $w" "(cd $w && fmt)" "git -C $w fmt" "cd /nonexistent/dir && fmt" "cd" "cd ''"; do
+    run "$(agent_post_bash s1 "$w" "$c")"; check "agent Bash '$c' exits 0" 0
+  done
+  no_markers "agent Bash without a leading cd <worktree> marks nothing"
+  run "$(stop s1 "$r")"; check "agent Bash, even with the worktree as cwd, adds no root to the lead's list" 0
+}
+t_lead_bash_records_cwd_root() {
+  local r w; r=$(new_repo a); w="$T/$CASE-wt"; agent_worktree "$r" "$w"
+  echo n >"$w/src/new.c"; stamp "$w/src/new.c" 202001020000
+  run "$(post_bash s1 "$w" | jq --arg c "cd $r" '.tool_input={command:$c}')"; check "lead Bash exits 0" 0
+  no_markers "a lead's Bash cd marks nothing"
+  run "$(stop s1 "$r")"; check "a lead's Bash records its cwd root" 2 "$w" "src/new.c"
+}
+t_agent_memory_write_keeps_edits_live() {
+  local r; r=$(new_repo a); add_mem "$r" in_progress 2026-10-11-task; git -C "$r" add -A; git -C "$r" commit -q -m mem
+  run "$(agent_pre s1 "$r/src/a.c")"; check "(control) a committed in_progress memory is not live for an agent's edit" 2 "no live task memory"
+  run "$(agent_pre s1 "$r/docs/memories/2026-10-11-task.md")"; check "an agent's memory write passes" 0
+  run "$(agent_pre s1 "$r/src/a.c")"; check "an agent's later edit passes on the memory it wrote" 0
 }
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
